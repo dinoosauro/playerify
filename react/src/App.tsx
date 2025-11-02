@@ -22,8 +22,13 @@ export default function App() {
     refreshPlayback: Date.now(),
     next: false,
     forceReRender: false,
-    sendDataProvided: false
+    sendDataProvided: false,
   });
+
+  // Variables using for authenticating with Spotify
+
+  let codeVerifier = useRef<string>("");
+  let refreshToken = useRef<string>("");
   /**
    * The link of the current Spotify resource
    */
@@ -34,12 +39,28 @@ export default function App() {
   let backgroundImageFirstTab = useRef<HTMLImageElement>(null);
   let lastRequestDate = useRef<number>(0);
   useEffect(() => {
-    window.addEventListener("message", (msg) => { // Prepare getting the token
+    window.addEventListener("message", async (msg) => { // Prepare getting the token
       if (msg.origin !== window.location.origin) return;
       const json = JSON.parse(msg.data);
-      if (json.token) {
-        updateState(prevState => { return { ...prevState, token: json.token, next: true } });
-        window.updateRenderState && window.updateRenderState(prevState => { return { ...prevState, tokenUpdate: prevState.tokenUpdate + 1 } })
+      console.log(json);
+      if (json.code) {
+        const tokenReq = await fetch("https://accounts.spotify.com/api/token", {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/x-www-form-urlencoded"
+        },
+        body: new URLSearchParams({
+          client_id: APIValues.spotify.clientId,
+          grant_type: "authorization_code",
+          code: json.code,
+          redirect_uri: `${window.location.href.substring(0, window.location.href.lastIndexOf("/"))}/oauth.html`,
+          code_verifier: codeVerifier.current
+        })
+      });
+      const tokenJson = await tokenReq.json();
+      console.log(tokenJson);
+      if (tokenJson.refresh_token) refreshToken.current = tokenJson.refresh_token;
+      if (tokenJson.access_token) updateState(prev => {return {...prev, token: tokenJson.access_token, next: true}})
       }
     });
     window.addEventListener("focus", () => { // Since browsers usually make the tab sleep when the user changes it, refresh the data when it gains again focus
@@ -57,6 +78,7 @@ export default function App() {
   }, [state.sendDataProvided])
   useEffect(() => { // Make a request to Spotify API for the currently-playing track
     (async () => {
+      if (!window.updateRenderState) return;
       if (state.token !== "" && state.token !== null && (Date.now() - lastRequestDate.current) > 4500) { // Wait at least 4500 ms from each request
         lastRequestDate.current = Date.now()
         const request = await fetch(`https://api.spotify.com/v1/me/player?additional_types=track,episode`, {
@@ -65,7 +87,7 @@ export default function App() {
           }
         });
         if (request.status === 401) {
-          getSpotiToken();
+          await getSpotiToken();
           return;
         }
         if (!request.status.toString().startsWith("2")) throw new Error("Failed Spotify request");
@@ -85,22 +107,23 @@ export default function App() {
       })()
     }
   }, [backgroundImageFirstTab])
-  function getSpotiToken() {
-    updateState(prevState => { return { ...prevState, token: null } }); // Make the previous token null, so that, until there's a new token, requests won't be sent.
-    const win = window.open(`https://accounts.spotify.com/authorize?response_type=token&client_id=${encodeURIComponent(APIValues.spotify.clientId)}&scope=${encodeURIComponent(APIValues.spotify.scope)}&redirect_uri=${window.location.href.substring(0, window.location.href.lastIndexOf("/"))}/oauth.html`, "_blank", "width=500,height=350");
-    if (!win || win?.closed) {
-      let div = document.createElement("div");
-      createRoot(div).render(<Dialog>
-        <h3>User interaction is required</h3>
-        <label>Spotify token is expired. Please click on the button below to get it again.</label><br></br>
-        <button onClick={() => {
-          getSpotiToken();
-          (div.querySelector(".dialog") as HTMLDivElement).style.opacity = "0";
-          setTimeout(() => div.remove(), 210)
-        }}>Get token</button>
-      </Dialog>);
-      (document.querySelector("[data-canvasexport]")?.parentElement ?? document.body).append(div);
-    }
+  async function getSpotiToken() {
+    console.log(refreshToken.current);
+    if (refreshToken.current === "") return;
+    const tokenReq = await fetch("https://accounts.spotify.com/api/token", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded"
+      },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: refreshToken.current,
+        client_id: APIValues.spotify.clientId
+      })
+    });
+    const tokenJson = await tokenReq.json();
+    if (tokenJson.refresh_token) refreshToken.current = tokenJson.refresh_token;
+    if (tokenJson.access_token) updateState(prevState => { return { ...prevState, token: tokenJson.access_token } }); // Make the previous token null, so that, until there's a new token, requests won't be sent.
   }
   return <>
     <Header></Header>
@@ -109,7 +132,19 @@ export default function App() {
     {!state.next ? <>
       <div className="introductionAdapt">
         <span style={{ float: "left" }}>
-          <button style={{ marginRight: "10px" }} onClick={getSpotiToken}>Connect to Spotify</button>
+          <button style={{ marginRight: "10px" }} onClick={async () => {
+            if (!localStorage.getItem("Playerify-CustomClientID")) {
+              const clientId = prompt("Do you want to use a custom client ID? The default one probably won't work with Playerify.");
+              if (clientId) {
+                localStorage.setItem("Playerify-CustomClientID", clientId);
+                APIValues.spotify.clientId = clientId;
+              }
+            }
+            const possible = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+            codeVerifier.current = crypto.getRandomValues(new Uint8Array(64)).reduce((acc, x) => acc + possible[x % possible.length], "");
+            const challenge = btoa(String.fromCharCode(...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(codeVerifier.current))))).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+            if (!window.open(`https://accounts.spotify.com/authorize?response_type=code&client_id=${encodeURIComponent(APIValues.spotify.clientId)}&scope=${encodeURIComponent(APIValues.spotify.scope)}&redirect_uri=${window.location.href.substring(0, window.location.href.lastIndexOf("/"))}/oauth.html&code_challenge_method=S256&code_challenge=${challenge}`, "_blank", "width=500,height=350")) alert("We tried to open a window to log in with Spotify, but your browser has blocked it.");
+          }}>Connect to Spotify</button>
           <button style={{ backgroundColor: "var(--card)" }} onClick={() => updateState(prevState => { return { ...prevState, next: true, sendDataProvided: true } })}>Manually add metadata</button><br></br><br></br>
           <i style={{ textDecoration: "underline", fontSize: "0.7em" }} onClick={() => {
             let div = document.createElement("div");
@@ -148,7 +183,7 @@ export default function App() {
                   body: body
                 });
                 if (req.status === 401) {
-                  getSpotiToken(); // Get a new token
+                  await getSpotiToken(); // Get a new token
                   throw new Error("Failed Spotify request")
                 }
                 if (!link.endsWith("devices") && req.status !== 204) throw new Error("Failed Spotify request"); // The devices endpoint is the only one which returns content inside the request
